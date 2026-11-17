@@ -16,8 +16,8 @@ def metadata():
         "parameters": [{"key": "weight_mode", "label": "目标层权重", "type": "select", "default": "population", "options": [{"value": "population", "label": "按抽样框规模"}, {"value": "equal", "label": "各区域等权"}]}, {"key": "minimum_cell", "label": "分层最低观察量", "type": "number", "default": 50, "min": 10, "max": 500}],
         "workbench_title": "样本结构与加权透视", "action_label": "计算加权率与反转检查", "unit": "%", "accent": "oklch(53% 0.09 215)", "style": "field-notebook",
         "seed_story": ["08:30 上传南岭_服务点通达_分层观察日表.csv，共30天120行。", "08:45 复核中心区抽样框6200个点、外围区3800个点。", "09:00 按抽样框规模加权，最低分层观察量50。", "09:10 查看两队各区域的合格数、观察数与层内比率。", "09:20 对照未加权合计，检查辛普森方向反转。", "10:00 切换等权目标作敏感性比较，不能覆盖原始运行记录。", "15:00 将权重、分母和限制写入研究附件，创建本地简报分发计划。"],
-        "method": "层内p_h=Σ合格数/Σ观察数；标准化率p=ΣW_h p_h，W_h取统一抽样框占比或等权。近似方差ΣW_h²p_h(1−p_h)/n_h；方向反转比较A−B的原始合计与每层方向。",
-        "limitations": ["假设层内观察可近似独立；置信区间未处理路线聚类和有限总体修正。", "队伍比较用于说明样本构成影响，不是人员绩效排名或随机实验因果结论。"],
+        "method": "层内p_h=Σ合格数/Σ观察数；标准化率p=ΣW_h p_h，W_h取统一抽样框占比或等权。近似方差ΣW_h²p_h(1−p_h)/n_h；方向反转比较A−B的原始合计与每层方向。启用有限总体修正规则时，各层方差项乘以(1−n_h/N_h)，层内观察量超过框规模N_h拒绝计算。",
+        "limitations": ["假设层内观察可近似独立；置信区间未处理路线聚类；有限总体修正由计算规则版本控制，见规则发布页。", "队伍比较用于说明样本构成影响，不是人员绩效排名或随机实验因果结论。"],
     }
 
 
@@ -43,7 +43,9 @@ def _integer(value, name, minimum):
     return int(answer)
 
 
-def analyze(records, params):
+def analyze(records, params, rule=None):
+    rule = rule or {}
+    fpc = bool(rule.get("fpc"))
     if not isinstance(records, list) or not records:
         raise ValueError("请先提供区域分层观察日表")
     mode = params.get("weight_mode", "population")
@@ -87,18 +89,21 @@ def analyze(records, params):
         for zone in zones:
             cell = cells[(team, zone)]
             n, passed = cell["n"], cell["passed"]
+            if fpc and n > frame[zone]:
+                raise ValueError(f"{team}/{zone}观察量{n}超过抽样框规模{frame[zone]}，有限总体修正规则拒绝计算")
             rate = passed / n
             weight = weights[zone]
+            correction = 1 - n / frame[zone] if fpc else 1.0
             weighted += weight * rate
-            variance += weight ** 2 * rate * (1 - rate) / n
-            inverse_eff += weight ** 2 / n
+            variance += weight ** 2 * rate * (1 - rate) / n * correction
+            inverse_eff += weight ** 2 * correction / n
             numerator += passed
             denominator += n
             output.append({"team": team, "zone": zone, "passed": passed, "observed": n, "rate": round(rate*100, 3), "weight": round(weight*100, 2), "contribution": round(weight*rate*100, 3)})
             if n < minimum:
                 warnings.append(f"{team}/{zone}仅{n}个观察点，低于最低量{minimum}。")
         se = math.sqrt(variance)
-        estimates[team] = {"rate": weighted, "low": max(0, weighted-1.96*se), "high": min(1, weighted+1.96*se), "effective_n": 1/inverse_eff}
+        estimates[team] = {"rate": weighted, "low": max(0, weighted-1.96*se), "high": min(1, weighted+1.96*se), "effective_n": 1/inverse_eff if inverse_eff > 0 else frame_total}
         raw_rates[team] = numerator / denominator
     raw_delta = raw_rates["A队"] - raw_rates["B队"]
     layer_deltas = [cells[("A队", zone)]["passed"]/cells[("A队", zone)]["n"] - cells[("B队", zone)]["passed"]/cells[("B队", zone)]["n"] for zone in zones]
@@ -112,5 +117,7 @@ def analyze(records, params):
         "table": {"columns": [{"key": "team", "label": "采样队"}, {"key": "zone", "label": "区域层"}, {"key": "passed", "label": "合格分子"}, {"key": "observed", "label": "观察分母"}, {"key": "rate", "label": "层内合格率%"}, {"key": "weight", "label": "统一目标权重%"}, {"key": "contribution", "label": "加权贡献百分点"}], "rows": output},
         "chart": {"type": "bar", "labels": zones + ["原始总计", "加权总计"], "series": [{"name": team, "values": [round(cells[(team, zone)]["passed"]/cells[(team, zone)]["n"]*100, 3) for zone in zones] + [round(raw_rates[team]*100, 3), round(estimates[team]["rate"]*100, 3)]} for team in ("A队", "B队")]},
         "findings": [f"{team}：近似95%区间{estimates[team]['low']:.2%}至{estimates[team]['high']:.2%}，权重有效样本量{estimates[team]['effective_n']:.1f}。" for team in ("A队", "B队")] + ["合计先累加合格数与观察数再求比；不平均每日比率。", "目标权重在两队间保持一致；样本构成不同不能直接当成队伍绩效差异。"],
+        "intervals": {team: {"rate": round(estimates[team]["rate"], 6), "low": round(estimates[team]["low"], 6), "high": round(estimates[team]["high"], 6), "width": round(estimates[team]["high"]-estimates[team]["low"], 6), "effective_n": round(estimates[team]["effective_n"], 3)} for team in ("A队", "B队")},
+        "rule": {"fpc": fpc},
         "method": metadata()["method"], "warnings": warnings,
     }
